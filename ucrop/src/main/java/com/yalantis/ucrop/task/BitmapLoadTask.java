@@ -1,22 +1,29 @@
 package com.yalantis.ucrop.task;
 
+import android.Manifest.permission;
 import android.content.Context;
+import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Matrix;
 import android.net.Uri;
 import android.os.AsyncTask;
+import android.os.Build;
+import android.os.ParcelFileDescriptor;
+import android.support.annotation.NonNull;
+import android.support.annotation.Nullable;
+import android.support.v4.content.ContextCompat;
+import android.text.TextUtils;
 import android.util.Log;
 
-import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
-
-import com.yalantis.ucrop.UCropHttpClientStore;
 import com.yalantis.ucrop.callback.BitmapLoadCallback;
 import com.yalantis.ucrop.model.ExifInfo;
 import com.yalantis.ucrop.util.BitmapLoadUtils;
+import com.yalantis.ucrop.util.FileUtils;
 
 import java.io.File;
+import java.io.FileDescriptor;
+import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -37,8 +44,6 @@ import okio.Sink;
 public class BitmapLoadTask extends AsyncTask<Void, Void, BitmapLoadTask.BitmapWorkerResult> {
 
     private static final String TAG = "BitmapWorkerTask";
-
-    private static final int MAX_BITMAP_SIZE = 100 * 1024 * 1024;   // 100 MB
 
     private final Context mContext;
     private Uri mInputUri;
@@ -90,8 +95,27 @@ public class BitmapLoadTask extends AsyncTask<Void, Void, BitmapLoadTask.BitmapW
             return new BitmapWorkerResult(e);
         }
 
+        final ParcelFileDescriptor parcelFileDescriptor;
+        try {
+            parcelFileDescriptor = mContext.getContentResolver().openFileDescriptor(mInputUri, "r");
+        } catch (FileNotFoundException e) {
+            return new BitmapWorkerResult(e);
+        }
+
+        final FileDescriptor fileDescriptor;
+        if (parcelFileDescriptor != null) {
+            fileDescriptor = parcelFileDescriptor.getFileDescriptor();
+        } else {
+            return new BitmapWorkerResult(new NullPointerException("ParcelFileDescriptor was null for given Uri: [" + mInputUri + "]"));
+        }
+
         final BitmapFactory.Options options = new BitmapFactory.Options();
         options.inJustDecodeBounds = true;
+        BitmapFactory.decodeFileDescriptor(fileDescriptor, null, options);
+        if (options.outWidth == -1 || options.outHeight == -1) {
+            return new BitmapWorkerResult(new IllegalArgumentException("Bounds for bitmap could not be retrieved from the Uri: [" + mInputUri + "]"));
+        }
+
         options.inSampleSize = BitmapLoadUtils.calculateInSampleSize(options, mRequiredWidth, mRequiredHeight);
         options.inJustDecodeBounds = false;
 
@@ -100,28 +124,20 @@ public class BitmapLoadTask extends AsyncTask<Void, Void, BitmapLoadTask.BitmapW
         boolean decodeAttemptSuccess = false;
         while (!decodeAttemptSuccess) {
             try {
-                InputStream stream = mContext.getContentResolver().openInputStream(mInputUri);
-                try {
-                    decodeSampledBitmap = BitmapFactory.decodeStream(stream, null, options);
-                    if (options.outWidth == -1 || options.outHeight == -1) {
-                        return new BitmapWorkerResult(new IllegalArgumentException("Bounds for bitmap could not be retrieved from the Uri: [" + mInputUri + "]"));
-                    }
-                } finally {
-                    BitmapLoadUtils.close(stream);
-                }
-                if (checkSize(decodeSampledBitmap, options)) continue;
+                decodeSampledBitmap = BitmapFactory.decodeFileDescriptor(fileDescriptor, null, options);
                 decodeAttemptSuccess = true;
             } catch (OutOfMemoryError error) {
                 Log.e(TAG, "doInBackground: BitmapFactory.decodeFileDescriptor: ", error);
                 options.inSampleSize *= 2;
-            } catch (IOException e) {
-                Log.e(TAG, "doInBackground: ImageDecoder.createSource: ", e);
-                return new BitmapWorkerResult(new IllegalArgumentException("Bitmap could not be decoded from the Uri: [" + mInputUri + "]", e));
             }
         }
 
         if (decodeSampledBitmap == null) {
             return new BitmapWorkerResult(new IllegalArgumentException("Bitmap could not be decoded from the Uri: [" + mInputUri + "]"));
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
+            BitmapLoadUtils.close(parcelFileDescriptor);
         }
 
         int exifOrientation = BitmapLoadUtils.getExifOrientation(mContext, mInputUri);
@@ -145,25 +161,39 @@ public class BitmapLoadTask extends AsyncTask<Void, Void, BitmapLoadTask.BitmapW
     }
 
     private void processInputUri() throws NullPointerException, IOException {
-        Log.d(TAG, "Uri scheme: " + mInputUri.getScheme());
-        if (isDownloadUri(mInputUri)) {
+        String inputUriScheme = mInputUri.getScheme();
+        Log.d(TAG, "Uri scheme: " + inputUriScheme);
+        if ("http".equals(inputUriScheme) || "https".equals(inputUriScheme)) {
             try {
                 downloadFile(mInputUri, mOutputUri);
             } catch (NullPointerException | IOException e) {
                 Log.e(TAG, "Downloading failed", e);
                 throw e;
             }
-        } else if (isContentUri(mInputUri)) {
-            try {
-                copyFile(mInputUri, mOutputUri);
-            } catch (NullPointerException | IOException e) {
-                Log.e(TAG, "Copying failed", e);
-                throw e;
+        } else if ("content".equals(inputUriScheme)) {
+            String path = getFilePath();
+            if (!TextUtils.isEmpty(path) && new File(path).exists()) {
+                mInputUri = Uri.fromFile(new File(path));
+            } else {
+                try {
+                    copyFile(mInputUri, mOutputUri);
+                } catch (NullPointerException | IOException e) {
+                    Log.e(TAG, "Copying failed", e);
+                    throw e;
+                }
             }
-        } else if (!isFileUri(mInputUri)) {
-            String inputUriScheme = mInputUri.getScheme();
+        } else if (!"file".equals(inputUriScheme)) {
             Log.e(TAG, "Invalid Uri scheme " + inputUriScheme);
             throw new IllegalArgumentException("Invalid Uri scheme" + inputUriScheme);
+        }
+    }
+
+    private String getFilePath() {
+        if (ContextCompat.checkSelfPermission(mContext, permission.READ_EXTERNAL_STORAGE)
+                == PackageManager.PERMISSION_GRANTED) {
+            return FileUtils.getPath(mContext, mInputUri);
+        } else {
+            return null;
         }
     }
 
@@ -178,14 +208,9 @@ public class BitmapLoadTask extends AsyncTask<Void, Void, BitmapLoadTask.BitmapW
         OutputStream outputStream = null;
         try {
             inputStream = mContext.getContentResolver().openInputStream(inputUri);
+            outputStream = new FileOutputStream(new File(outputUri.getPath()));
             if (inputStream == null) {
                 throw new NullPointerException("InputStream for given input Uri is null");
-            }
-
-            if (isContentUri(outputUri)) {
-                outputStream = mContext.getContentResolver().openOutputStream(outputUri);
-            } else {
-                outputStream = new FileOutputStream(new File(outputUri.getPath()));
             }
 
             byte buffer[] = new byte[1024];
@@ -210,26 +235,19 @@ public class BitmapLoadTask extends AsyncTask<Void, Void, BitmapLoadTask.BitmapW
             throw new NullPointerException("Output Uri is null - cannot download image");
         }
 
-        OkHttpClient client = UCropHttpClientStore.INSTANCE.getClient();
+        OkHttpClient client = new OkHttpClient();
 
         BufferedSource source = null;
         Sink sink = null;
         Response response = null;
         try {
             Request request = new Request.Builder()
-                .url(inputUri.toString())
-                .build();
+                    .url(inputUri.toString())
+                    .build();
             response = client.newCall(request).execute();
             source = response.body().source();
 
-            OutputStream outputStream;
-
-            if (isContentUri(mOutputUri)) {
-                outputStream = mContext.getContentResolver().openOutputStream(outputUri);
-            } else {
-                outputStream = new FileOutputStream(new File(outputUri.getPath()));
-            }
-
+            OutputStream outputStream = mContext.getContentResolver().openOutputStream(outputUri);
             if (outputStream != null) {
                 sink = Okio.sink(outputStream);
                 source.readAll(sink);
@@ -259,27 +277,4 @@ public class BitmapLoadTask extends AsyncTask<Void, Void, BitmapLoadTask.BitmapW
         }
     }
 
-    private boolean checkSize(Bitmap bitmap, BitmapFactory.Options options) {
-        int bitmapSize = bitmap != null ? bitmap.getByteCount() : 0;
-        if (bitmapSize > MAX_BITMAP_SIZE) {
-            options.inSampleSize *= 2;
-            return true;
-        }
-        return false;
-    }
-
-    private boolean isDownloadUri(Uri uri) {
-        final String schema = uri.getScheme();
-        return schema.equals("http") || schema.equals("https");
-    }
-
-    private boolean isContentUri(Uri uri) {
-        final String schema = uri.getScheme();
-        return schema.equals("content");
-    }
-
-    private boolean isFileUri(Uri uri) {
-        final String schema = uri.getScheme();
-        return schema.equals("file");
-    }
 }

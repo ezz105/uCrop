@@ -21,7 +21,7 @@ public class GestureCropImageView extends CropImageView {
 
     private float mMidPntX, mMidPntY;
 
-    private boolean mIsRotateEnabled = true, mIsScaleEnabled = true, mIsGestureEnabled = true;
+    private boolean mIsRotateEnabled = true, mIsScaleEnabled = true;
     private int mDoubleTapScaleSteps = 5;
 
     public GestureCropImageView(Context context) {
@@ -52,14 +52,6 @@ public class GestureCropImageView extends CropImageView {
         return mIsRotateEnabled;
     }
 
-    public void setGestureEnabled(boolean gestureEnabled) {
-        mIsGestureEnabled = gestureEnabled;
-    }
-
-    public boolean isGestureEnabled() {
-        return mIsGestureEnabled;
-    }
-
     public void setDoubleTapScaleSteps(int doubleTapScaleSteps) {
         mDoubleTapScaleSteps = doubleTapScaleSteps;
     }
@@ -85,9 +77,7 @@ public class GestureCropImageView extends CropImageView {
             mMidPntY = (event.getY(0) + event.getY(1)) / 2;
         }
 
-        if (mIsGestureEnabled) {
-            mGestureDetector.onTouchEvent(event);
-        }
+        mGestureDetector.onTouchEvent(event);
 
         if (mIsScaleEnabled) {
             mScaleDetector.onTouchEvent(event);
